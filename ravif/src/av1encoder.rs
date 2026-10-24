@@ -77,6 +77,8 @@ pub struct Encoder<'exif_slice> {
     color_model: ColorModel,
     /// How many threads should be used (0 = match core count), None - use global rayon thread pool
     threads: Option<usize>,
+    /// How many AV1 tiles to aim for. None - one per thread
+    tiles: Option<usize>,
     /// [`AlphaColorMode`]
     alpha_color_mode: AlphaColorMode,
     /// 8 or 10
@@ -98,6 +100,7 @@ impl<'exif_slice> Encoder<'exif_slice> {
             premultiplied_alpha: false,
             color_model: ColorModel::YCbCr,
             threads: None,
+            tiles: None,
             exif: None,
             alpha_color_mode: AlphaColorMode::UnassociatedClean,
         }
@@ -181,6 +184,19 @@ impl<'exif_slice> Encoder<'exif_slice> {
     pub fn with_num_threads(mut self, num_threads: Option<usize>) -> Self {
         assert!(num_threads.is_none_or(|n| n > 0));
         self.threads = num_threads;
+        self
+    }
+
+    /// Fixes how many tiles the image is split into, so that the output doesn't depend on the number of threads.
+    ///
+    /// The default `None` uses one tile per thread, so the same image encodes to different bytes on machines with different core counts.
+    /// Images too small for that many tiles get fewer. Panics if 0.
+    #[inline(always)]
+    #[track_caller]
+    #[must_use]
+    pub fn with_tiles(mut self, tiles: Option<usize>) -> Self {
+        assert!(tiles.is_none_or(|n| n > 0));
+        self.tiles = tiles;
         self
     }
 
@@ -410,6 +426,7 @@ impl Encoder<'_> {
                     quantizer: self.quantizer.into(),
                     speed: SpeedTweaks::from_my_preset(self.speed, self.quantizer),
                     threads,
+                    tiles: self.tiles,
                     pixel_range: color_pixel_range,
                     chroma_sampling: ChromaSampling::Cs444,
                     color_description,
@@ -427,6 +444,7 @@ impl Encoder<'_> {
                         quantizer: self.alpha_quantizer.into(),
                         speed: SpeedTweaks::from_my_preset(self.speed, self.alpha_quantizer),
                         threads,
+                    tiles: self.tiles,
                         pixel_range: PixelRange::Full,
                         chroma_sampling: ChromaSampling::Cs400,
                         color_description: None,
@@ -641,6 +659,8 @@ struct Av1EncodeConfig {
     pub speed: SpeedTweaks,
     /// 0 means num_cpus
     pub threads: Option<usize>,
+    /// None means one per thread
+    pub tiles: Option<usize>,
     pub pixel_range: PixelRange,
     pub chroma_sampling: ChromaSampling,
     pub color_description: Option<ColorDescription>,
@@ -650,8 +670,8 @@ fn rav1e_config(p: &Av1EncodeConfig) -> Config {
     // AV1 needs all the CPU power you can give it,
     // except when it'd create inefficiently tiny tiles
     let tiles = {
-        let threads = p.threads.unwrap_or_else(rayon::current_num_threads);
-        threads.min((p.width * p.height) / (p.speed.min_tile_size as usize).pow(2))
+        let tiles = p.tiles.or(p.threads).unwrap_or_else(rayon::current_num_threads);
+        tiles.min((p.width * p.height) / (p.speed.min_tile_size as usize).pow(2))
     };
     let speed_settings = p.speed.speed_settings();
     let cfg = Config::new()
